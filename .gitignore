@@ -1,0 +1,30 @@
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+.buildvenv/
+
+# Build / release
+build/
+dist/
+*.spec.bak
+
+# IceHaloStack runtime/cache
+IceHaloStackRuntime*/
+IceHaloStackBuild*/
+
+# Output folders
+sequence/
+_video_frames/
+*.mp4
+*.mov
+*.gif
+
+# OS
+.DS_Store
+Thumbs.db

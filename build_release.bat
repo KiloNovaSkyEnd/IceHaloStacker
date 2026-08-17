@@ -12,7 +12,7 @@ set "BASEMODE="
 set "PKGS=numpy pillow tifffile rawpy opencv-python-headless imageio-ffmpeg pyinstaller"
 
 echo ============================================================
-echo IceHaloStack v0.9.4.15 - Windows Standalone EXE Builder
+echo IceHaloStack v0.9.4.17 - Windows Standalone EXE Builder
 echo Build environment: %BUILDROOT%
 echo Output: %~dp0dist\IceHaloStack\IceHaloStack.exe
 echo ============================================================

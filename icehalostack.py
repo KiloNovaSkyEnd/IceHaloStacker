@@ -8,7 +8,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 APP_NAME = 'IceHaloStack'
-VERSION = '0.9.4.15'
+VERSION = '0.9.4.17'
 RAW_EXTS = {'.arw','.cr2','.cr3','.nef','.nrw','.raf','.rw2','.orf','.pef','.dng','.srw','.3fr','.erf','.kdc','.mos','.mrw','.raw','.rwl','.sr2'}
 RASTER_EXTS = {'.tif','.tiff','.png','.jpg','.jpeg','.bmp'}
 ALL_EXTS = RAW_EXTS | RASTER_EXTS
@@ -400,27 +400,107 @@ def _emboss_components(img, angle=135.0, height=1.0, amount=100.0):
     return x, lum, directional, relief, edge_mag, amount_scale
 
 
-def emboss_filter(img, angle=135.0, height=1.0, amount=100.0, style='Color Emboss'):
-    """Emboss filter body with selectable color-preserving or gray behavior."""
+def _photoshop_emboss_filter(img, angle=135.0, height=1.0, amount=100.0):
+    """PS-style Emboss approximation.
+
+    Photoshop's published description of Emboss is a neutral/gray stamped
+    surface whose edges retain the original fill color.  This implementation
+    follows that visual model instead of merely preserving the source RGB
+    everywhere.  Flat regions settle near 50% gray, directional relief creates
+    the raised/recessed shading, and a broadened edge mask restores strong
+    source chroma around the traced edges.
+    """
+    np, *_rest = _deps(); cv2 = _rest[-1]
+    x = np.clip(img.astype(np.float32), 0, 1)
+    lum = (0.2126*x[...,0] + 0.7152*x[...,1] + 0.0722*x[...,2]).astype(np.float32)
+    a = math.radians(float(angle))
+    h = max(float(height), 0.1)
+    dx = math.cos(a) * h
+    dy = -math.sin(a) * h
+
+    if cv2 is not None:
+        M1=np.float32([[1,0, dx/2.0],[0,1, dy/2.0]])
+        M2=np.float32([[1,0,-dx/2.0],[0,1,-dy/2.0]])
+        lum_hi=cv2.warpAffine(lum,M1,(lum.shape[1],lum.shape[0]),flags=cv2.INTER_LINEAR,borderMode=cv2.BORDER_REFLECT)
+        lum_lo=cv2.warpAffine(lum,M2,(lum.shape[1],lum.shape[0]),flags=cv2.INTER_LINEAR,borderMode=cv2.BORDER_REFLECT)
+        rgb_hi=cv2.warpAffine(x,M1,(x.shape[1],x.shape[0]),flags=cv2.INTER_LINEAR,borderMode=cv2.BORDER_REFLECT)
+        rgb_lo=cv2.warpAffine(x,M2,(x.shape[1],x.shape[0]),flags=cv2.INTER_LINEAR,borderMode=cv2.BORDER_REFLECT)
+        gx=cv2.Sobel(lum,cv2.CV_32F,1,0,ksize=3,borderType=cv2.BORDER_REFLECT)
+        gy=cv2.Sobel(lum,cv2.CV_32F,0,1,ksize=3,borderType=cv2.BORDER_REFLECT)
+        edge=np.sqrt(gx*gx+gy*gy).astype(np.float32)
+    else:
+        ix=int(round(dx/2.0));iy=int(round(dy/2.0))
+        lum_hi=np.roll(np.roll(lum,iy,axis=0),ix,axis=1)
+        lum_lo=np.roll(np.roll(lum,-iy,axis=0),-ix,axis=1)
+        rgb_hi=np.roll(np.roll(x,iy,axis=0),ix,axis=1)
+        rgb_lo=np.roll(np.roll(x,-iy,axis=0),-ix,axis=1)
+        gx=(np.roll(lum,-1,axis=1)-np.roll(lum,1,axis=1))*0.5
+        gy=(np.roll(lum,-1,axis=0)-np.roll(lum,1,axis=0))*0.5
+        edge=np.sqrt(gx*gx+gy*gy).astype(np.float32)
+
+    amount_scale=max(float(amount),0.0)/100.0
+    lum_dir=(lum_hi-lum_lo).astype(np.float32)
+    rgb_dir=(rgb_hi-rgb_lo).astype(np.float32)
+
+    # Neutral stamped carrier. Amount controls relief depth, as the PS Amount
+    # control visually does, but the gain is compressed above 100% to avoid
+    # premature clipping at the 500% end of the UI range.
+    relief_gain=1.55*(0.65*min(amount_scale,1.0)+0.35*np.sqrt(max(amount_scale,0.0)))
+    shade=np.clip(0.5 + lum_dir*relief_gain,0.0,1.0).astype(np.float32)
+
+    # Edge tracing: combine Sobel energy with the directional difference and
+    # broaden it slightly. This is the key difference from the old Gray mode:
+    # Photoshop-like edges keep visibly more of the source fill color instead
+    # of becoming almost monochrome.
+    energy=np.abs(lum_dir)*(4.2+1.2*min(amount_scale,2.0)) + edge*(1.6+0.5*min(amount_scale,2.0))
+    edge_mask=np.clip(energy,0.0,1.0).astype(np.float32)
+    if cv2 is not None:
+        sigma=max(0.35,min(3.0,h*0.32))
+        edge_mask=cv2.GaussianBlur(edge_mask,(0,0),sigmaX=sigma,sigmaY=sigma,borderType=cv2.BORDER_REFLECT)
+        edge_mask=np.clip(edge_mask*1.22,0.0,1.0)
+    else:
+        edge_mask=np.clip(edge_mask,0.0,1.0)
+
+    source_chroma=x-lum[...,None]
+    dir_lum=(0.2126*rgb_dir[...,0]+0.7152*rgb_dir[...,1]+0.0722*rgb_dir[...,2]).astype(np.float32)
+    dir_chroma=rgb_dir-dir_lum[...,None]
+
+    # At Amount=100, colored edge traces are deliberately strong.  Flat areas
+    # remain neutral gray, matching the characteristic PS Emboss look, while
+    # colored halo/cloud edges no longer wash out.
+    color_gain=np.clip(0.62+0.38*min(amount_scale,1.0)+0.10*max(amount_scale-1.0,0.0),0.45,1.25)
+    trace=(source_chroma*color_gain + dir_chroma*(0.30+0.12*min(amount_scale,2.0)))
+    out=shade[...,None] + trace*edge_mask[...,None]
+
+    # Very faint chroma shoulder around traced edges avoids the unnaturally
+    # abrupt gray-to-color transition that made the previous mode look dull.
+    shoulder=np.clip(edge_mask*0.38,0.0,0.38)[...,None]
+    out += source_chroma*shoulder*(0.34+0.10*min(amount_scale,2.0))
+    return np.clip(out,0,1).astype(np.float32)
+
+
+def emboss_filter(img, angle=135.0, height=1.0, amount=100.0, style='Photoshop Emboss'):
+    """Emboss filter body with PS-style, color-preserving and gray modes."""
     np, *_ = _deps()
+    st=str(style or 'Photoshop Emboss').lower()
+    if 'photoshop' in st or st.startswith('ps ') or 'ps-like' in st:
+        return _photoshop_emboss_filter(img,angle,height,amount)
     x, lum, directional, relief, edge_mag, amount_scale = _emboss_components(img, angle, height, amount)
-    st=str(style or 'Color Emboss').lower()
     if 'gray' in st or '灰' in st:
         chroma=x-lum[...,None]
         edge_mask=np.clip(edge_mag*(3.5 + 2.0*min(amount_scale,2.0)), 0.0, 1.0)[...,None]
         color_strength=np.clip(0.18 + 0.42*min(amount_scale,1.5), 0.0, 0.70)
         out=relief[...,None] + chroma*edge_mask*color_strength
         return np.clip(out,0,1).astype(np.float32)
-    # Color Emboss: flat areas are unchanged; the relief changes only luminance,
-    # so the original color/chroma is preserved instead of turning the frame gray.
+    # Existing Color Emboss is intentionally preserved unchanged.
     target_lum=np.clip(lum + directional*(1.35*amount_scale),0.0,1.0)
     out=x + (target_lum-lum)[...,None]
     return np.clip(out,0,1).astype(np.float32)
 
 
 def apply_emboss(img, angle=135.0, height=1.0, amount=100.0, opacity=100.0,
-                 mode='Normal', style='Color Emboss'):
-    """Apply Emboss with Photoshop-like blend modes and opacity."""
+                 mode='Normal', style='Photoshop Emboss'):
+    """Apply Emboss with selectable blend modes and opacity."""
     np, *_ = _deps()
     emb = emboss_filter(img, angle, height, amount, style=style)
     if mode == 'Overlay':
@@ -428,7 +508,8 @@ def apply_emboss(img, angle=135.0, height=1.0, amount=100.0, opacity=100.0,
     elif mode == 'Soft Light':
         mixed = softlight_blend(img, emb)
     elif mode == 'Linear Light':
-        if 'gray' in str(style).lower() or '灰' in str(style):
+        st=str(style).lower()
+        if 'gray' in st or '灰' in st or 'photoshop' in st or st.startswith('ps '):
             mixed = np.clip(img + 2*(emb-0.5),0,1)
         else:
             mixed = np.clip(img + 2*(emb-img),0,1)
@@ -1053,7 +1134,7 @@ def apply_timelapse_pipeline(img, cfg, curve_points=None, stop_after=None):
         return out
 
     if cfg.get('emboss'):
-        out = apply_emboss(out, cfg.get('emboss_angle',-128.0), cfg.get('emboss_height',1.0), cfg.get('emboss_amount',100.0), cfg.get('emboss_opacity',100.0), cfg.get('emboss_blend','Normal'), cfg.get('emboss_style','Color Emboss'))
+        out = apply_emboss(out, cfg.get('emboss_angle',-128.0), cfg.get('emboss_height',1.0), cfg.get('emboss_amount',100.0), cfg.get('emboss_opacity',100.0), cfg.get('emboss_blend','Normal'), cfg.get('emboss_style','Photoshop Emboss'))
     if stop_after == 'emboss':
         return out
 
@@ -1113,7 +1194,7 @@ class TimelapseWindow(tk.Toplevel):
         self.p_curves=tk.BooleanVar(value=False)
         self.p_usm=tk.BooleanVar(value=False); self.p_usm_amount=tk.DoubleVar(value=float(getattr(a,'usm_amount',tk.DoubleVar(value=100)).get() or 100)); self.p_usm_radius=tk.DoubleVar(value=float(getattr(a,'usm_radius',tk.DoubleVar(value=2)).get())); self.p_usm_threshold=tk.DoubleVar(value=float(getattr(a,'usm_threshold',tk.DoubleVar(value=0)).get())); self.p_usm_passes=tk.IntVar(value=1)
         self.p_hp=tk.BooleanVar(value=False); self.p_hp_radius=tk.DoubleVar(value=float(getattr(a,'hp_radius',tk.DoubleVar(value=10)).get())); self.p_hp_amount=tk.DoubleVar(value=float(getattr(a,'hp_amount',tk.DoubleVar(value=100)).get())); self.p_hp_mode=tk.StringVar(value=str(getattr(a,'hp_mode',tk.StringVar(value='Overlay')).get()))
-        self.p_emboss=tk.BooleanVar(value=False); self.p_emboss_angle=tk.DoubleVar(value=float(getattr(a,'emboss_angle',tk.DoubleVar(value=-128)).get())); self.p_emboss_height=tk.DoubleVar(value=float(getattr(a,'emboss_height',tk.DoubleVar(value=1)).get())); self.p_emboss_amount=tk.DoubleVar(value=float(getattr(a,'emboss_strength',tk.DoubleVar(value=100)).get())); self.p_emboss_style=tk.StringVar(value=str(getattr(a,'emboss_style',tk.StringVar(value='Color Emboss')).get())); self.p_emboss_blend=tk.StringVar(value=str(getattr(a,'emboss_blend',tk.StringVar(value='Normal')).get())); self.p_emboss_opacity=tk.DoubleVar(value=float(getattr(a,'emboss_opacity',tk.DoubleVar(value=100)).get()))
+        self.p_emboss=tk.BooleanVar(value=False); self.p_emboss_angle=tk.DoubleVar(value=float(getattr(a,'emboss_angle',tk.DoubleVar(value=-128)).get())); self.p_emboss_height=tk.DoubleVar(value=float(getattr(a,'emboss_height',tk.DoubleVar(value=1)).get())); self.p_emboss_amount=tk.DoubleVar(value=float(getattr(a,'emboss_strength',tk.DoubleVar(value=100)).get())); self.p_emboss_style=tk.StringVar(value=str(getattr(a,'emboss_style',tk.StringVar(value='Photoshop Emboss')).get())); self.p_emboss_blend=tk.StringVar(value=str(getattr(a,'emboss_blend',tk.StringVar(value='Normal')).get())); self.p_emboss_opacity=tk.DoubleVar(value=float(getattr(a,'emboss_opacity',tk.DoubleVar(value=100)).get()))
         self.p_channel=tk.BooleanVar(value=False); self.p_channel_output=tk.StringVar(value=str(getattr(a,'channel_output',tk.StringVar(value='灰色')).get())); self.p_channel_mono=tk.BooleanVar(value=bool(getattr(a,'channel_mono',tk.BooleanVar(value=True)).get()))
         self.p_channel_red=tk.DoubleVar(value=float(getattr(a,'channel_red',tk.DoubleVar(value=40)).get())); self.p_channel_green=tk.DoubleVar(value=float(getattr(a,'channel_green',tk.DoubleVar(value=40)).get())); self.p_channel_blue=tk.DoubleVar(value=float(getattr(a,'channel_blue',tk.DoubleVar(value=20)).get())); self.p_channel_constant=tk.DoubleVar(value=float(getattr(a,'channel_constant',tk.DoubleVar(value=0)).get()))
         self.p_channel_noise=tk.BooleanVar(value=bool(getattr(a,'channel_noise_protect',tk.BooleanVar(value=True)).get())); self.p_channel_noise_strength=tk.DoubleVar(value=float(getattr(a,'channel_noise_strength',tk.DoubleVar(value=30)).get())); self.p_channel_noise_radius=tk.DoubleVar(value=float(getattr(a,'channel_noise_radius',tk.DoubleVar(value=0.8)).get()))
@@ -1561,13 +1642,13 @@ class TimelapseWindow(tk.Toplevel):
 
         sec=ttk.LabelFrame(proc,text='F. 浮雕 Emboss',padding=6); sec.pack(fill='x',pady=3)
         ttk.Checkbutton(sec,text='启用浮雕',variable=self.p_emboss).pack(anchor='w')
-        r=ttk.Frame(sec);r.pack(fill='x',pady=2);ttk.Label(r,text='Style').pack(side='left');ttk.Combobox(r,textvariable=self.p_emboss_style,state='readonly',width=20,values=['Color Emboss','Gray Emboss']).pack(side='right')
+        r=ttk.Frame(sec);r.pack(fill='x',pady=2);ttk.Label(r,text='Style').pack(side='left');ttk.Combobox(r,textvariable=self.p_emboss_style,state='readonly',width=20,values=['Photoshop Emboss','Color Emboss','Gray Emboss']).pack(side='right')
         self._slider_row(sec,'Angle °',self.p_emboss_angle,-180,180,1,reset_value=-128.0)
         dialrow=ttk.Frame(sec);dialrow.pack(fill='x',pady=(1,3));ttk.Label(dialrow,text='Angle Dial / 方向圆盘',foreground='#666').pack(side='left');AngleDial(dialrow,self.p_emboss_angle,command=lambda v:self._schedule_live_preview(dragging=True),release_command=lambda v:self._schedule_live_preview(force=True),reset_value=-128.0,size=66).pack(side='right')
         self._slider_row(sec,'Height px',self.p_emboss_height,1,200,1,reset_value=1.0); self._slider_row(sec,'Amount %',self.p_emboss_amount,1,500,1,reset_value=100.0)
         r=ttk.Frame(sec);r.pack(fill='x',pady=2);ttk.Label(r,text='Blend Mode').pack(side='left');ttk.Combobox(r,textvariable=self.p_emboss_blend,state='readonly',width=16,values=['Normal','Overlay','Soft Light','Linear Light']).pack(side='right')
         self._slider_row(sec,'Opacity %',self.p_emboss_opacity,0,100,1,reset_value=100.0)
-        ttk.Label(sec,text='Color Emboss 默认保留原图色彩；Gray Emboss 为经典中性灰浮雕。',foreground='#666',wraplength=390).pack(anchor='w',pady=(2,0))
+        ttk.Label(sec,text='Photoshop Emboss：PS 风格灰色浮雕基底 + 原色边缘描迹；Color Emboss：完整保留原图色彩；Gray Emboss：旧版中性灰浮雕。',foreground='#666',wraplength=390).pack(anchor='w',pady=(2,0))
         ttk.Button(sec,text='预览：浮雕后',command=lambda:self.preview_stage('emboss')).pack(fill='x',pady=(4,0))
 
         sec=ttk.LabelFrame(proc,text='G. Channel Mixer',padding=6); sec.pack(fill='x',pady=3)
@@ -2866,7 +2947,7 @@ class TimelapseNodeWindow(tk.Toplevel):
         def b(k,d=0):
             try:return float(bv[k].get())
             except Exception:return float(d)
-        return dict(stretch=True,stretch_strength=self._appval('stretch_strength',8),stretch_black=self._appval('stretch_black',0),basic=True,exposure=b('exposure'),contrast=b('contrast'),highlights=b('highlights'),shadows=b('shadows'),whites=b('whites'),blacks=b('blacks'),clarity=b('clarity'),dehaze=b('dehaze'),vibrance=b('vibrance'),saturation=b('saturation'),bgr=False,background=False,bg_radius=80.0,bg_strength=100.0,curves=False,usm=False,usm_amount=self._appval('usm_amount',100),usm_radius=self._appval('usm_radius',2),usm_threshold=self._appval('usm_threshold',0),usm_passes=1,highpass=False,hp_radius=self._appval('hp_radius',10),hp_amount=self._appval('hp_amount',100),hp_mode=str(getattr(self.app,'hp_mode',tk.StringVar(value='Overlay')).get()),emboss=False,emboss_angle=self._appval('emboss_angle',-128),emboss_height=self._appval('emboss_height',1),emboss_amount=self._appval('emboss_strength',100),emboss_style=str(getattr(self.app,'emboss_style',tk.StringVar(value='Color Emboss')).get()),emboss_blend=str(getattr(self.app,'emboss_blend',tk.StringVar(value='Normal')).get()),emboss_opacity=self._appval('emboss_opacity',100),br=False,channel=False,channel_output=str(getattr(self.app,'channel_output',tk.StringVar(value='灰色')).get()),channel_mono=bool(getattr(self.app,'channel_mono',tk.BooleanVar(value=True)).get()),channel_red=self._appval('channel_red',40),channel_green=self._appval('channel_green',40),channel_blue=self._appval('channel_blue',20),channel_constant=self._appval('channel_constant',0),channel_noise=bool(getattr(self.app,'channel_noise_protect',tk.BooleanVar(value=True)).get()),channel_noise_strength=self._appval('channel_noise_strength',30),channel_noise_radius=self._appval('channel_noise_radius',0.8),temperature=0.0,tint=0.0,texture=0.0,base_curve=False,hsl_hue=0.0,hsl_sat=0.0,hsl_lum=0.0,
+        return dict(stretch=True,stretch_strength=self._appval('stretch_strength',8),stretch_black=self._appval('stretch_black',0),basic=True,exposure=b('exposure'),contrast=b('contrast'),highlights=b('highlights'),shadows=b('shadows'),whites=b('whites'),blacks=b('blacks'),clarity=b('clarity'),dehaze=b('dehaze'),vibrance=b('vibrance'),saturation=b('saturation'),bgr=False,background=False,bg_radius=80.0,bg_strength=100.0,curves=False,usm=False,usm_amount=self._appval('usm_amount',100),usm_radius=self._appval('usm_radius',2),usm_threshold=self._appval('usm_threshold',0),usm_passes=1,highpass=False,hp_radius=self._appval('hp_radius',10),hp_amount=self._appval('hp_amount',100),hp_mode=str(getattr(self.app,'hp_mode',tk.StringVar(value='Overlay')).get()),emboss=False,emboss_angle=self._appval('emboss_angle',-128),emboss_height=self._appval('emboss_height',1),emboss_amount=self._appval('emboss_strength',100),emboss_style=str(getattr(self.app,'emboss_style',tk.StringVar(value='Photoshop Emboss')).get()),emboss_blend=str(getattr(self.app,'emboss_blend',tk.StringVar(value='Normal')).get()),emboss_opacity=self._appval('emboss_opacity',100),br=False,channel=False,channel_output=str(getattr(self.app,'channel_output',tk.StringVar(value='灰色')).get()),channel_mono=bool(getattr(self.app,'channel_mono',tk.BooleanVar(value=True)).get()),channel_red=self._appval('channel_red',40),channel_green=self._appval('channel_green',40),channel_blue=self._appval('channel_blue',20),channel_constant=self._appval('channel_constant',0),channel_noise=bool(getattr(self.app,'channel_noise_protect',tk.BooleanVar(value=True)).get()),channel_noise_strength=self._appval('channel_noise_strength',30),channel_noise_radius=self._appval('channel_noise_radius',0.8),temperature=0.0,tint=0.0,texture=0.0,base_curve=False,hsl_hue=0.0,hsl_sat=0.0,hsl_lum=0.0,
             cg_shadow_h=220.0,cg_shadow_s=0.0,cg_mid_h=35.0,cg_mid_s=0.0,cg_high_h=45.0,cg_high_s=0.0,cg_balance=0.0,
             detail_sharpen=0.0,detail_radius=1.0,luma_nr=0.0,chroma_nr=0.0,opt_distortion=0.0,opt_vignette=0.0,opt_ca=0.0,
             cal_red_h=0.0,cal_red_s=0.0,cal_green_h=0.0,cal_green_s=0.0,cal_blue_h=0.0,cal_blue_s=0.0,
@@ -3180,7 +3261,7 @@ class TimelapseNodeWindow(tk.Toplevel):
                 out=apply_highpass(out,float(cfg.get('hp_radius',10)),float(cfg.get('hp_amount',100)),str(cfg.get('hp_mode','Overlay')))
         elif node=='emboss':
             if cfg.get('emboss',False):
-                out=apply_emboss(out,float(cfg.get('emboss_angle',-128)),float(cfg.get('emboss_height',1)),float(cfg.get('emboss_amount',100)),float(cfg.get('emboss_opacity',100)),str(cfg.get('emboss_blend','Normal')),str(cfg.get('emboss_style','Color Emboss')))
+                out=apply_emboss(out,float(cfg.get('emboss_angle',-128)),float(cfg.get('emboss_height',1)),float(cfg.get('emboss_amount',100)),float(cfg.get('emboss_opacity',100)),str(cfg.get('emboss_blend','Normal')),str(cfg.get('emboss_style','Photoshop Emboss')))
         elif node=='br':
             if cfg.get('br',False):
                 out=apply_channel_mixer(out,
@@ -3568,14 +3649,14 @@ class TimelapseNodeWindow(tk.Toplevel):
         elif key=='highpass':
             self._dlg_slider(body,f,'hp_radius','Radius px',0.1,250,0.1);self._dlg_slider(body,f,'hp_amount','Opacity %',0,100,1);v=tk.StringVar(value=str(cfg.get('hp_mode','Overlay')));r=ttk.Frame(body);r.pack(fill='x',pady=4);ttk.Label(r,text='Mode').pack(side='left');cb=ttk.Combobox(r,textvariable=v,state='readonly',values=['Overlay','Soft Light','Linear Light']);cb.pack(side='right');cb.bind('<<ComboboxSelected>>',lambda e:self._cfgset(f,'hp_mode',v.get(),True))
         elif key=='emboss':
-            sv=tk.StringVar(value=str(cfg.get('emboss_style','Color Emboss')));r=ttk.Frame(body);r.pack(fill='x',pady=4);ttk.Label(r,text='Style / 浮雕类型').pack(side='left');cb=ttk.Combobox(r,textvariable=sv,state='readonly',values=['Color Emboss','Gray Emboss'],width=18);cb.pack(side='right');cb.bind('<<ComboboxSelected>>',lambda e:self._cfgset(f,'emboss_style',sv.get(),True))
+            sv=tk.StringVar(value=str(cfg.get('emboss_style','Photoshop Emboss')));r=ttk.Frame(body);r.pack(fill='x',pady=4);ttk.Label(r,text='Style / 浮雕类型').pack(side='left');cb=ttk.Combobox(r,textvariable=sv,state='readonly',values=['Photoshop Emboss','Color Emboss','Gray Emboss'],width=18);cb.pack(side='right');cb.bind('<<ComboboxSelected>>',lambda e:self._cfgset(f,'emboss_style',sv.get(),True))
             av=self._dlg_slider(body,f,'emboss_angle','Angle °',-180,180,1)
             dialbox=ttk.Frame(body);dialbox.pack(fill='x',pady=(2,6));ttk.Label(dialbox,text='Angle Dial / 角度圆盘\n拖动方向杆；双击恢复 -128°',foreground='#666').pack(side='left',anchor='w')
             AngleDial(dialbox,av,command=lambda val:(f['cfg'].__setitem__('emboss_angle',float(val)),self._flow_changed(dragging=True)),release_command=lambda val:(f['cfg'].__setitem__('emboss_angle',float(val)),self._flow_changed(force=True)),reset_value=-128.0,size=76).pack(side='right',padx=(8,12))
             self._dlg_slider(body,f,'emboss_height','Height px',1,200,1);self._dlg_slider(body,f,'emboss_amount','Amount %',1,500,1)
             bv=tk.StringVar(value=str(cfg.get('emboss_blend','Normal')));r=ttk.Frame(body);r.pack(fill='x',pady=4);ttk.Label(r,text='Blend Mode / 混合模式').pack(side='left');cb=ttk.Combobox(r,textvariable=bv,state='readonly',values=['Normal','Overlay','Soft Light','Linear Light'],width=18);cb.pack(side='right');cb.bind('<<ComboboxSelected>>',lambda e:self._cfgset(f,'emboss_blend',bv.get(),True))
             self._dlg_slider(body,f,'emboss_opacity','Opacity %',0,100,1)
-            ttk.Label(body,text='Color Emboss：保留原图色彩，只把方向性浮雕作用到亮度结构。\nGray Emboss：经典中性灰浮雕本体。',foreground='#666',wraplength=430).pack(anchor='w',pady=(6,0))
+            ttk.Label(body,text='Photoshop Emboss：更接近 PS 的灰色浮雕基底，并在边缘保留明显原色描迹。\nColor Emboss：保留原图色彩，只把方向性浮雕作用到亮度结构。\nGray Emboss：保留旧版经典中性灰浮雕。',foreground='#666',wraplength=430).pack(anchor='w',pady=(6,0))
         elif key=='channel':
             outv=tk.StringVar(value=str(cfg.get('channel_output','灰色')));r=ttk.Frame(body);r.pack(fill='x',pady=3);ttk.Label(r,text='输出通道').pack(side='left');cb=ttk.Combobox(r,textvariable=outv,state='readonly',values=['灰色','红色','绿色','蓝色']);cb.pack(side='right');cb.bind('<<ComboboxSelected>>',lambda e:self._cfgset(f,'channel_output',outv.get(),True))
             mono=tk.BooleanVar(value=bool(cfg.get('channel_mono',True)));ttk.Checkbutton(body,text='单色',variable=mono,command=lambda:self._cfgset(f,'channel_mono',bool(mono.get()),True)).pack(anchor='w')
@@ -3619,8 +3700,16 @@ class TimelapseNodeWindow(tk.Toplevel):
             self.status.set(f'{label} 已恢复中性值：{reset_value:g}')
             return 'break'
         sc=ttk.Scale(box,from_=frm,to=to,variable=v,command=lambda x:changed());sc.pack(fill='x')
+        node_click={'time':0}
+        def node_press(ev=None):
+            now=int(getattr(ev,'time',0) or 0)
+            if now and node_click['time'] and 0 < now-node_click['time'] <= 420:
+                node_click['time']=0
+                return reset_slider(ev)
+            node_click['time']=now
+        sc.bind('<ButtonPress-1>',node_press,add='+')
         sc.bind('<ButtonRelease-1>',lambda ev:changed(force=True))
-        sc.bind('<Double-Button-1>',reset_slider)
+        sc.bind('<Double-Button-1>',reset_slider,add='+')
         e.bind('<Return>',lambda ev:(changed(force=True),'break')[1]);e.bind('<FocusOut>',lambda ev:changed(force=True))
         return v
     def _cfgset(self,flow,key,value,force=False):
@@ -4331,6 +4420,12 @@ class App(tk.Tk):
         self._last_preview_request=0.0
         self._preview_generation=0
         self._last_display_preview=None
+        # Main Base preview is computed off the Tk thread. Only the newest request
+        # is allowed to render; stale slider-drag frames are discarded.
+        self._main_preview_request_serial=0
+        self._main_async_preview_running=False
+        self._main_async_preview_pending=False
+        self._main_async_preview_quality='drag'
         self.output_depth=tk.StringVar(value='32-bit float TIFF')
         self.status=tk.StringVar(value='等待导入冰晕延时序列')
         self.detail=tk.StringVar(value='LINEAR · 尚未生成 Master')
@@ -4819,10 +4914,10 @@ class App(tk.Tk):
         self.emboss_angle=tk.DoubleVar(value=-128.0)
         self.emboss_height=tk.DoubleVar(value=1.0)
         self.emboss_strength=tk.DoubleVar(value=100.0)
-        self.emboss_style=tk.StringVar(value='Color Emboss')
+        self.emboss_style=tk.StringVar(value='Photoshop Emboss')
         self.emboss_blend=tk.StringVar(value='Normal')
         self.emboss_opacity=tk.DoubleVar(value=100.0)
-        r=ttk.Frame(em);r.pack(fill='x',pady=(2,4));ttk.Label(r,text='类型 / Style').pack(side='left');ttk.Combobox(r,textvariable=self.emboss_style,state='readonly',values=['Color Emboss','Gray Emboss'],width=18).pack(side='right')
+        r=ttk.Frame(em);r.pack(fill='x',pady=(2,4));ttk.Label(r,text='类型 / Style').pack(side='left');ttk.Combobox(r,textvariable=self.emboss_style,state='readonly',values=['Photoshop Emboss','Color Emboss','Gray Emboss'],width=18).pack(side='right')
         self._scale(em,'角度 (°)',self.emboss_angle,-180,180,1,reset_value=-128.0)
         dialrow=ttk.Frame(em);dialrow.pack(fill='x',pady=(2,5))
         ttk.Label(dialrow,text='方向 / Angle Dial\n拖动圆内方向杆改变角度\n双击圆盘恢复 -128°',foreground='#666').pack(side='left',anchor='w')
@@ -4831,7 +4926,7 @@ class App(tk.Tk):
         self._scale(em,'数量 (%)',self.emboss_strength,1,500,1)
         r=ttk.Frame(em);r.pack(fill='x',pady=(3,3));ttk.Label(r,text='混合模式 / Blend').pack(side='left');ttk.Combobox(r,textvariable=self.emboss_blend,state='readonly',values=['Normal','Overlay','Soft Light','Linear Light'],width=18).pack(side='right')
         self._scale(em,'不透明度 / Opacity %',self.emboss_opacity,0,100,1,reset_value=100.0)
-        ttk.Label(em,text='Color Emboss 默认保持彩色；Gray Emboss 为经典灰色浮雕。',foreground='#666').pack(anchor='w',pady=(2,3))
+        ttk.Label(em,text='Photoshop Emboss 为推荐 PS 风格；Color Emboss 保留现有彩色模式；Gray Emboss 保留旧版灰色模式。',foreground='#666').pack(anchor='w',pady=(2,3))
         ttk.Button(em,text='应用浮雕',command=self.do_emboss).pack(fill='x',pady=(5,8))
 
     def _labeled_entry(self,parent,label,var):
@@ -4897,14 +4992,22 @@ class App(tk.Tk):
         # focused numeric field before Tk's Scale class binding changes its value.
         entry._icehalo_commit = commit_entry
 
+        click_state={'time':0}
         def begin_drag(event=None):
+            # ttk::scale's class binding may move the thumb on the second click before
+            # <Double-Button-1> becomes visible on some Windows themes. Detect the
+            # second press ourselves at widget-binding priority and stop the class
+            # binding after restoring the neutral/default value.
+            now=int(getattr(event,'time',0) or 0)
+            if now and click_state['time'] and 0 < now-click_state['time'] <= 420:
+                click_state['time']=0
+                return reset_slider(event)
+            click_state['time']=now
             focused=self.focus_get()
             if isinstance(focused, (tk.Entry, ttk.Entry)):
                 cb=getattr(focused, '_icehalo_commit', None)
                 if cb is not None:
                     cb()
-                # Move focus away before the Scale updates. This prevents a later
-                # FocusOut callback from restoring the old typed value over the slider.
                 try:
                     scale.focus_set()
                 except Exception:
@@ -4928,6 +5031,8 @@ class App(tk.Tk):
             except Exception:
                 pass
             self._slider_dragging=False
+            try:self.status.set(f'{label} 已恢复中性/默认值：{float(reset_value):g}')
+            except Exception:pass
             self._schedule_preview(immediate=True)
             return 'break'
 
@@ -4950,7 +5055,7 @@ class App(tk.Tk):
         scale.pack(fill='x')
         scale.bind('<ButtonPress-1>', begin_drag, add='+')
         scale.bind('<ButtonRelease-1>', end_drag, add='+')
-        scale.bind('<Double-Button-1>', reset_slider)
+        scale.bind('<Double-Button-1>', reset_slider, add='+')
         return scale
 
     def _setup_var_traces(self):
@@ -4969,20 +5074,55 @@ class App(tk.Tk):
         self._schedule_preview(immediate=False)
 
     def _schedule_preview(self, immediate=False):
-        # Collapse dozens of slider events into one render. During dragging we target
-        # ~20-25 fps; after release, render one higher-quality frame immediately.
+        # Coalesce high-frequency Scale events. Base/Camera-Raw preview is expensive,
+        # so it is rendered in a single-flight worker: while one frame is running we
+        # remember only the newest requested state instead of queueing every mouse move.
+        self._main_preview_request_serial += 1
         if self._preview_after_id is not None:
             try:
                 self.after_cancel(self._preview_after_id)
             except Exception:
                 pass
             self._preview_after_id=None
-        delay = 0 if immediate else (28 if self._slider_dragging else 55)
+        delay = 0 if immediate else (18 if self._slider_dragging else 55)
         self._preview_after_id=self.after(delay, self._run_scheduled_preview)
 
     def _run_scheduled_preview(self):
         self._preview_after_id=None
+        try:
+            current_tab=self.tabs.select()
+        except Exception:
+            current_tab=''
+        # Base is the heaviest interactive panel. Never run its full preview pipeline
+        # synchronously on the Tk/UI thread; doing so is what caused Not Responding.
+        if (not self.is_linear) and current_tab == str(getattr(self,'tab_basic','')):
+            self._request_async_basic_preview()
+            return
         self.refresh_preview()
+
+    def _request_async_basic_preview(self):
+        serial=int(self._main_preview_request_serial)
+        quality='drag' if self._slider_dragging else 'hq'
+        if self._main_async_preview_running:
+            self._main_async_preview_pending=True
+            self._main_async_preview_quality=quality
+            return
+        base=self._preview_base_image()
+        if base is None:
+            return
+        cfg=self._basic_cfg_from_ui(proxy_scale=float(getattr(self,'_preview_proxy_scale',1.0)))
+        # The cached proxy is read-only for this worker: apply_base_editor creates its
+        # own float working array before processing, so the master/proxy cache is safe.
+        self._main_async_preview_running=True
+        self._main_async_preview_pending=False
+        self._main_async_preview_quality=quality
+        def work():
+            try:
+                out=apply_base_editor(base,cfg,None)
+                self.queue.put(('main_basic_preview',(serial,out,quality,None)))
+            except Exception as e:
+                self.queue.put(('main_basic_preview',(serial,None,quality,str(e))))
+        threading.Thread(target=work,daemon=True).start()
 
     def _set_var_silently(self, var, value):
         self._var_trace_suspend = True
@@ -5322,12 +5462,18 @@ class App(tk.Tk):
         h,w=img.shape[:2]
         current_tab=self.tabs.select() if hasattr(self,'tabs') else ''
         detail_tab=(current_tab == str(getattr(self,'tab_detail','')))
-        # Dragging remains deliberately light. On mouse-up, spatial filters use a
-        # much denser proxy so USM/High Pass/Emboss track the full-resolution result.
+        basic_tab=(current_tab == str(getattr(self,'tab_basic','')))
+        # Dragging uses a small proxy but the SAME processing algorithms. Mouse-up
+        # switches to a denser verification proxy. Base is intentionally capped below
+        # the Detail page because Camera-Raw style processing runs many sequential
+        # operations; this keeps feedback fast while proxy_scale preserves spatial
+        # radii and avoids the old preview/final-strength mismatch.
         if self._slider_dragging:
-            target_h,target_w=480,800
+            target_h,target_w=280,500
         elif detail_tab:
             target_h,target_w=1500,2600
+        elif basic_tab:
+            target_h,target_w=720,1200
         else:
             target_h,target_w=950,1600
         scale=min(1.0, target_h/float(max(h,1)), target_w/float(max(w,1)))
@@ -5534,7 +5680,7 @@ class App(tk.Tk):
         StorageManagerDialog(self)
 
     def about(self):
-        messagebox.showinfo('关于',f'{APP_NAME} {VERSION}\n\n冰晕专用 RAW / Mean + Maximum 堆栈 / 图像处理原型。\n当前已包含实时 Mean 堆栈预览、暂停/继续/使用当前结果、基于建议值的 Asinh 预览/拉伸、基础/细节/曲线实时预览、PS 风格 High Pass/Emboss、通道混合器，以及 Linear Master 导出。高反差保留/浮雕默认关闭，数值支持双击输入；浮雕采用 Photoshop 风格角度/高度/数量参数与角度圆盘，并提供默认彩色浮雕、经典灰度浮雕、Blend Mode 与 Opacity；所有主调节页、节点参数页与延时左侧控制栏均支持鼠标滚轮滚动；主预览、延时参考预览、节点实时预览支持滚轮缩放，并可用 Z 一键回到 Fit。v0.4.0 加入预览防抖/拖动代理优化、滑块双击复位，并将 Asinh Strength 上限提高到 500。v0.5.0 加入并行 RAW 预解码与可选 NVIDIA CUDA/CuPy Mean 后端。v0.5.1 加入通用 CUDA Toolkit 检测与自动匹配 CuPy 安装，不修改系统 CUDA。v0.7.1 重构延时工作流；v0.7.6 在延时窗口内加入可直接拖动的 Curves 编辑器，并使用快速/高质量代理图显著提高参数拖动实时预览速度。 v0.9.4.14 将预览平移改为 Canvas Fast Pan，拖拽期间不再重新缩放或重建 PhotoImage。')
+        messagebox.showinfo('关于',f'{APP_NAME} {VERSION}\n\n冰晕专用 RAW / Mean + Maximum 堆栈 / 图像处理原型。\n当前已包含实时 Mean 堆栈预览、暂停/继续/使用当前结果、基于建议值的 Asinh 预览/拉伸、基础/细节/曲线实时预览、PS 风格 High Pass/Emboss、通道混合器，以及 Linear Master 导出。高反差保留/浮雕默认关闭，数值支持双击输入；浮雕采用 Photoshop 风格角度/高度/数量参数与角度圆盘，并提供 Photoshop Emboss、原有 Color Emboss、Gray Emboss、Blend Mode 与 Opacity；所有主调节页、节点参数页与延时左侧控制栏均支持鼠标滚轮滚动；主预览、延时参考预览、节点实时预览支持滚轮缩放，并可用 Z 一键回到 Fit。Base 实时预览采用单任务后台计算与过期帧丢弃，拖动滑块时不会在 UI 线程堆积计算。v0.4.0 加入预览防抖/拖动代理优化、滑块双击复位，并将 Asinh Strength 上限提高到 500。v0.5.0 加入并行 RAW 预解码与可选 NVIDIA CUDA/CuPy Mean 后端。v0.5.1 加入通用 CUDA Toolkit 检测与自动匹配 CuPy 安装，不修改系统 CUDA。v0.7.1 重构延时工作流；v0.7.6 在延时窗口内加入可直接拖动的 Curves 编辑器，并使用快速/高质量代理图显著提高参数拖动实时预览速度。 v0.9.4.14 将预览平移改为 Canvas Fast Pan，拖拽期间不再重新缩放或重建 PhotoImage。')
 
     def _set_stack_controls(self, active=False, paused=False):
         self.stack_active=active; self.stack_paused=paused
@@ -6003,6 +6149,24 @@ class App(tk.Tk):
                 elif kind=='accel':
                     backend,desc=val
                     self.accel_status.set((backend+' · '+desc) if backend=='CUDA' else ('CPU · '+desc))
+                elif kind=='main_basic_preview':
+                    serial,out,quality,err=val
+                    self._main_async_preview_running=False
+                    newest=(int(serial)==int(self._main_preview_request_serial))
+                    try:still_basic=((not self.is_linear) and self.tabs.select()==str(self.tab_basic))
+                    except Exception:still_basic=False
+                    if err is None and out is not None and newest and still_basic:
+                        self._last_display_preview=out
+                        self._render_main_preview(out,update_hist=(quality!='drag'))
+                    # If the user moved again while the worker was busy, launch exactly
+                    # one new frame using the latest parameter snapshot. Old frames are
+                    # never replayed, so dragging cannot build an unbounded backlog.
+                    if int(self._main_preview_request_serial) > int(serial) or self._main_async_preview_pending:
+                        self._main_async_preview_pending=False
+                        try:self.after(0,self._run_scheduled_preview)
+                        except Exception:pass
+                    elif err:
+                        self.status.set('预览计算失败：'+str(err))
                 elif kind=='stack_done':
                     out,result,count,total,stopped_early,perf_stats,stack_method=val
                     self.progress.set(count/total*100 if total else 100)
